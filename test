@@ -1,0 +1,148 @@
+// feeder_server.c  (phiên bản tương thích Mongoose 7.x ổn định)
+#include "mongoose.h"
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+
+#define TBL_COUNT     20
+#define POS_PER_TBL   15
+#define UART_DEV     "/dev/serial0"   // Đổi sang /dev/ttyUSB0 nếu dùng USB-TTL
+#define UART_BAUD     B9600
+
+static int g_uart_fd = -1;
+
+static int uart_open(const char *dev, speed_t baud) {
+  int fd = open(dev, O_RDWR | O_NOCTTY | O_SYNC);
+  if (fd < 0) return -1;
+  struct termios tio;
+  memset(&tio, 0, sizeof(tio));
+  if (tcgetattr(fd, &tio) != 0) { close(fd); return -2; }
+  cfsetospeed(&tio, baud); cfsetispeed(&tio, baud);
+  tio.c_cflag = (tio.c_cflag & ~CSIZE) | CS8;   // 8 data
+  tio.c_cflag |= (CLOCAL | CREAD);
+  tio.c_cflag &= ~(PARENB | PARODD);            // N
+  tio.c_cflag &= ~CSTOPB;                       // 1 stop
+  tio.c_cflag &= ~CRTSCTS;                      // no HW flow
+  tio.c_iflag = tio.c_oflag = tio.c_lflag = 0;
+  tio.c_cc[VMIN] = 0; tio.c_cc[VTIME] = 10;     // read timeout 1s
+  if (tcsetattr(fd, TCSANOW, &tio) != 0) { close(fd); return -3; }
+  tcflush(fd, TCIOFLUSH);
+  return fd;
+}
+
+static unsigned char xorsum(const unsigned char *p, size_t n) {
+  unsigned char x = 0; for (size_t i = 0; i < n; i++) x ^= p[i]; return x;
+}
+
+static size_t build_frame(unsigned char *out, int group, int line,
+                          const char tables[TBL_COUNT][POS_PER_TBL + 1]) {
+  unsigned char *w = out;
+  *w++ = '@';
+
+  int g1 = (group / 10) % 10, g0 = group % 10, l0 = line % 10;
+  *w++ = '0' + g1;
+  *w++ = '0' + g0;
+  *w++ = '0' + l0;
+
+  for (int t = 0; t < TBL_COUNT; t++) {
+    for (int i = 0; i < POS_PER_TBL; i++) {
+      char c = tables[t][i];
+      if (!isxdigit((unsigned char)c)) c = '0';
+      *w++ = (unsigned char) toupper((unsigned char) c);
+    }
+  }
+
+  unsigned char cs = xorsum(out + 1, 3 + TBL_COUNT * POS_PER_TBL);
+  static const char HEX[] = "0123456789ABCDEF";
+  *w++ = HEX[(cs >> 4) & 0xF];
+  *w++ = HEX[cs & 0xF];
+
+  *w++ = '\r';
+  return (size_t)(w - out);
+}
+
+static void send_to_uart(int group, int line,
+                         const char tables[TBL_COUNT][POS_PER_TBL + 1]) {
+  if (g_uart_fd < 0) {
+    g_uart_fd = uart_open(UART_DEV, UART_BAUD);
+    if (g_uart_fd < 0) {
+      fprintf(stderr, "UART open failed: %s\n", strerror(errno));
+      return;
+    }
+  }
+  unsigned char frame[4 + TBL_COUNT * POS_PER_TBL + 2 + 1];
+  size_t n = build_frame(frame, group, line, tables);
+  write(g_uart_fd, frame, n);
+  tcdrain(g_uart_fd);
+}
+
+// Trợ giúp: lấy chuỗi JSON -> copy vào buffer, tự free con trỏ tạm.
+static void json_get_str_buf(struct mg_str json, const char *path,
+                             char *dst, size_t dstsz) {
+  char *s = mg_json_get_str(json, path);   // có thể trả NULL
+  if (dstsz) dst[0] = 0;
+  if (s) {
+    strncpy(dst, s, dstsz ? dstsz - 1 : 0);
+    if (dstsz) dst[dstsz - 1] = 0;
+    free(s);
+  }
+}
+
+// Handler API kiểu 3 tham số (chuẩn Mongoose 7.x)
+static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_HTTP_MSG) {
+    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+
+    // Không dùng mg_http_match_uri (vì có bản không có); so sánh trực tiếp URI
+    if (mg_vcmp(&hm->uri, "/API/setdata") == 0) {
+      // Đọc group/line dạng chuỗi rồi atoi
+      char buf[16];
+      json_get_str_buf(hm->body, "$.group", buf, sizeof(buf));
+      int group = atoi(buf);
+      json_get_str_buf(hm->body, "$.line", buf, sizeof(buf));
+      int line  = atoi(buf);
+
+      // Lấy 20 bảng, mỗi bảng 15 kí tự HEX
+      char tables[TBL_COUNT][POS_PER_TBL + 1];
+      memset(tables, 0, sizeof(tables));
+      for (int i = 0; i < TBL_COUNT; i++) {
+        char path[32]; snprintf(path, sizeof(path), "$.tables[%d]", i);
+        json_get_str_buf(hm->body, path, tables[i], sizeof(tables[i]));
+        for (int k = 0; k < POS_PER_TBL; k++)    // đảm bảo đủ 15 ký tự
+          if (tables[i][k] == 0) tables[i][k] = '0';
+      }
+
+      if (group < 0 || group > 99 || line < 0 || line > 9) {
+        mg_http_reply(c, 400, "", "Bad group/line\n");
+        return;
+      }
+      send_to_uart(group, line, tables);
+      mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "OK\n");
+    } else {
+      mg_http_reply(c, 404, "", "Not found\n");
+    }
+  }
+}
+
+int main(void) {
+  struct mg_mgr mgr;
+  mg_mgr_init(&mgr);
+  printf("HTTP server on http://0.0.0.0:8080\nUART dev: %s (9600-8N1)\n", UART_DEV);
+
+  // Chữ ký mới: handler 3 tham số + fn_data tùy chọn qua c->fn_data
+  if (mg_http_listen(&mgr, "http://0.0.0.0:8080", http_cb) == NULL) {
+    fprintf(stderr, "Listen failed\n");
+    return 1;
+  }
+  for (;;) mg_mgr_poll(&mgr, 100);
+  mg_mgr_free(&mgr);
+  if (g_uart_fd >= 0) close(g_uart_fd);
+  return 0;
+}
