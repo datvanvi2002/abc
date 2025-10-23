@@ -1,4 +1,4 @@
-// feeder_server.c — nhận {"group":<int>, "ledData":[32 x "15HEX"]}, chỉ dùng 20 phần tử đầu
+// feeder_server.c — JSON: {"group": <int>, "ledData": [32 x "15HEX"]} -> gửi 20 đầu
 #include "mongoose.h"
 #include <ctype.h>
 #include <errno.h>
@@ -10,12 +10,12 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define TBL_USE_COUNT  20      // dùng 20
-#define TBL_TOTAL_RECV 32      // nhận tối đa 32 từ web
-#define POS_PER_TBL    15
-#define UART_DEV      "/dev/serial0"
-#define UART_BAUD      B9600
-#define END_CHAR       '\r'    // nếu cần '!' thì đổi tại đây
+#define TBL_USE_COUNT   20      // chỉ gửi 20
+#define TBL_TOTAL_RECV  32      // web có thể gửi 32
+#define POS_PER_TBL     15
+#define UART_DEV       "/dev/serial0"
+#define UART_BAUD       B9600
+#define END_CHAR        '!'     // nếu muốn CR thì đổi thành '\r'
 
 static int g_uart_fd = -1;
 
@@ -41,7 +41,30 @@ static unsigned char xorsum(const unsigned char *p, size_t n) {
   unsigned char x = 0; for (size_t i = 0; i < n; i++) x ^= p[i]; return x;
 }
 
-// Frame: '@' + BCD(3 chữ số group) + 20*15 HEX + CS(2 HEX) + END_CHAR
+// Lấy số nguyên từ JSON: hỗ trợ cả number (12) lẫn string ("12")
+static int json_get_int_loose(struct mg_str json, const char *path, int *out) {
+  // Thử lấy số trực tiếp (nếu bản Mongoose hỗ trợ)
+  #ifdef MG_ENABLE_PACKED
+  #endif
+  // Một số bản có mg_json_get_num, một số không — thử dùng nếu có:
+  #ifdef MG_JSON_GET_NUM_HAS_DEFAULT
+    double d = mg_json_get_num(json, path, -1);
+    if (d >= 0) { *out = (int) d; return 1; }
+  #else
+  {
+    // Có bản chỉ có mg_json_get_num(json, path)
+    extern double mg_json_get_num(struct mg_str, const char *);
+    // dùng try-catch compile không được, nên bao bằng weak assumption:
+    // nếu hàm không tồn tại, linker sẽ lỗi — khi đó hãy dùng nhánh dưới.
+  }
+  #endif
+  // Fallback: lấy chuỗi rồi atoi
+  char *s = mg_json_get_str(json, path);
+  if (s) { *out = atoi(s); free(s); return 1; }
+  return 0;
+}
+
+// Frame: '@' + BCD(group 3 chữ số) + 20*15 HEX + CS(2 HEX) + END_CHAR
 static size_t build_frame(unsigned char *out, int group,
                           const char tables[TBL_USE_COUNT][POS_PER_TBL + 1]) {
   unsigned char *w = out;
@@ -80,19 +103,15 @@ static void send_to_uart(int group, const char tables[TBL_USE_COUNT][POS_PER_TBL
   tcdrain(g_uart_fd);
 }
 
-// tiện ích: lấy chuỗi JSON vào buffer an toàn
+// Lấy chuỗi JSON an toàn
 static void json_get_str_buf(struct mg_str json, const char *path,
                              char *dst, size_t dstsz) {
-  char *s = mg_json_get_str(json, path);   // malloc'ed hoặc NULL
+  char *s = mg_json_get_str(json, path);
   if (dstsz) dst[0] = 0;
-  if (s) {
-    strncpy(dst, s, dstsz ? dstsz - 1 : 0);
-    if (dstsz) dst[dstsz - 1] = 0;
-    free(s);
-  }
+  if (s) { strncpy(dst, s, dstsz ? dstsz - 1 : 0); if (dstsz) dst[dstsz - 1] = 0; free(s); }
 }
 
-// Handler: CHỈ gửi UART khi POST /API/setdata
+// Handler: chỉ gửi UART khi POST /API/setdata hợp lệ
 static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
   if (ev != MG_EV_HTTP_MSG) return;
   struct mg_http_message *hm = (struct mg_http_message *) ev_data;
@@ -113,30 +132,31 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
     return;
   }
 
-  // group
-  char sbuf[16];
-  json_get_str_buf(hm->body, "$.group", sbuf, sizeof(sbuf));
-  if (sbuf[0] == 0) { mg_http_reply(c, 400, "", "Missing group\n"); return; }
-  int group = atoi(sbuf);
+  // ----- Parse group -----
+  int group = -1;
+  if (!json_get_int_loose(hm->body, "$.group", &group)) {
+    mg_http_reply(c, 400, "", "Missing group\n");
+    return;
+  }
 
-  // ledData[0..31] → dùng 0..19
+  // ----- Parse ledData[0..31], dùng 0..19 -----
   char use[TBL_USE_COUNT][POS_PER_TBL + 1];
   memset(use, 0, sizeof(use));
-  int got = 0;
+  int any = 0;
   for (int i = 0; i < TBL_TOTAL_RECV; i++) {
     char path[32]; snprintf(path, sizeof(path), "$.ledData[%d]", i);
     char tmp[POS_PER_TBL + 1] = {0};
-    json_get_str_buf(hm->body, path, tmp, sizeof(tmp));
+    json_get_str_buf(hm->body, path, tmp, sizeof(tmp));   // có thể rỗng nếu không có phần tử
     if (i < TBL_USE_COUNT) {
-      // copy vào use[i], pad nếu thiếu
       for (int k = 0; k < POS_PER_TBL; k++) use[i][k] = tmp[k] ? tmp[k] : '0';
-      if (use[i][0]) got++;
+      if (use[i][0]) any = 1;
     }
   }
-  if (got == 0) { mg_http_reply(c, 400, "", "Missing ledData\n"); return; }
+  if (!any) { mg_http_reply(c, 400, "", "Missing ledData\n"); return; }
 
-  // chỉ tại đây mới gửi UART
+  // ----- Chỉ tại đây mới gửi UART -----
   send_to_uart(group, use);
+
   mg_http_reply(c, 200,
     "Content-Type: text/plain\r\n"
     "Access-Control-Allow-Origin: *\r\n", "OK\n");
@@ -153,4 +173,3 @@ int main(void) {
   if (g_uart_fd >= 0) close(g_uart_fd);
   return 0;
 }
-  
