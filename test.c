@@ -1,4 +1,4 @@
-// feeder_server.c  — bản sửa: dùng "group" + "ledData", pad group 3 chữ số
+// feeder_server.c — chỉ gửi UART khi POST /API/setdata; JSON: { "group": <int>, "ledData": [20x15HEX] }
 #include "mongoose.h"
 #include <ctype.h>
 #include <errno.h>
@@ -14,6 +14,7 @@
 #define POS_PER_TBL   15
 #define UART_DEV     "/dev/serial0"
 #define UART_BAUD     B9600
+#define END_CHAR      '!'  
 
 static int g_uart_fd = -1;
 
@@ -39,7 +40,7 @@ static unsigned char xorsum(const unsigned char *p, size_t n) {
   unsigned char x = 0; for (size_t i = 0; i < n; i++) x ^= p[i]; return x;
 }
 
-// Frame: '@' + BCD(group hundreds,tens,units) + 20*15 HEX + CS(2 HEX) + '\r'
+// Frame: '@' + BCD(group hundreds,tens,units) + 20*15 HEX + CS(2 HEX) + END_CHAR
 static size_t build_frame(unsigned char *out, int group,
                           const char tables[TBL_COUNT][POS_PER_TBL + 1]) {
   unsigned char *w = out;
@@ -65,7 +66,7 @@ static size_t build_frame(unsigned char *out, int group,
   static const char HEX[] = "0123456789ABCDEF";
   *w++ = HEX[(cs >> 4) & 0xF];
   *w++ = HEX[cs & 0xF];
-  *w++ = '\r';
+  *w++ = END_CHAR;
 
   return (size_t)(w - out);
 }
@@ -78,18 +79,15 @@ static void send_to_uart(int group, const char tables[TBL_COUNT][POS_PER_TBL + 1
   unsigned char frame[4 + TBL_COUNT * POS_PER_TBL + 2 + 1];
   size_t n = build_frame(frame, group, tables);
 
-  // Log khung để bạn xác nhận group đã pad đúng
   fprintf(stderr, "TX group=%03d, len=%zu\n", group, n);
-
   int w = write(g_uart_fd, frame, n);
   fprintf(stderr, "write()=%d, errno=%d\n", w, errno);
   tcdrain(g_uart_fd);
 }
 
-// helper: copy chuỗi JSON vào buffer an toàn
 static void json_get_str_buf(struct mg_str json, const char *path,
                              char *dst, size_t dstsz) {
-  char *s = mg_json_get_str(json, path);   // malloc'ed (hoặc NULL)
+  char *s = mg_json_get_str(json, path);  
   if (dstsz) dst[0] = 0;
   if (s) {
     strncpy(dst, s, dstsz ? dstsz - 1 : 0);
@@ -98,32 +96,53 @@ static void json_get_str_buf(struct mg_str json, const char *path,
   }
 }
 
-// Handler 3 tham số; chỉ GỬI UART khi có POST /API/setdata
 static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
     struct mg_http_message *hm = (struct mg_http_message *) ev_data;
 
-    if (mg_strcmp(hm->uri, mg_str("/API/setdata")) == 0) {
-      // Lấy group (số)
+    // CORS preflight
+    if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0 &&
+        mg_strcmp(hm->uri, mg_str("/API/setdata")) == 0) {
+      mg_http_reply(c, 204,
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n", "");
+      return;
+    }
+
+    // Chỉ xử lý POST /API/setdata
+    if (mg_strcmp(hm->method, mg_str("POST")) == 0 &&
+        mg_strcmp(hm->uri, mg_str("/API/setdata")) == 0) {
+
+      // Đọc group
       char buf[16];
       json_get_str_buf(hm->body, "$.group", buf, sizeof(buf));
-      int group = atoi(buf);                  // 0..999 (sẽ clamp khi build_frame)
+      if (buf[0] == 0) {
+        mg_http_reply(c, 400, "", "Missing group\n");
+        return;
+      }
+      int group = atoi(buf);   // sẽ clamp 0..999 trong build_frame
 
-      // Đọc mảng ledData[0..19] (mỗi phần tử 15 HEX)
+      // Đọc ledData[20]
       char tables[TBL_COUNT][POS_PER_TBL + 1];
       memset(tables, 0, sizeof(tables));
+      int filled = 0;
       for (int i = 0; i < TBL_COUNT; i++) {
         char path[32]; snprintf(path, sizeof(path), "$.ledData[%d]", i);
         json_get_str_buf(hm->body, path, tables[i], sizeof(tables[i]));
+        if (tables[i][0]) filled++;
         // đảm bảo đủ 15 ký tự
         for (int k = 0; k < POS_PER_TBL; k++)
           if (tables[i][k] == 0) tables[i][k] = '0';
       }
-
-      // Gửi UART NGAY KHI có POST hợp lệ
+      if (filled == 0) {
+        mg_http_reply(c, 400, "", "Missing ledData\n");
+        return;
+      }
       send_to_uart(group, tables);
-
-      mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "OK\n");
+      mg_http_reply(c, 200,
+        "Content-Type: text/plain\r\n"
+        "Access-Control-Allow-Origin: *\r\n", "OK\n");
     } else {
       mg_http_reply(c, 404, "", "Not found\n");
     }
@@ -134,7 +153,6 @@ int main(void) {
   struct mg_mgr mgr; mg_mgr_init(&mgr);
   printf("HTTP server on http://0.0.0.0:8080\nUART dev: %s (9600-8N1)\n", UART_DEV);
 
-  // Chỉ listen; KHÔNG gửi UART nếu không có POST
   if (mg_http_listen(&mgr, "http://0.0.0.0:8080", http_cb, NULL) == NULL) {
     fprintf(stderr, "Listen failed\n"); return 1;
   }
